@@ -1,0 +1,6 @@
+ProCam.xcodeproj/
+build/
+Payload/
+*.ipa
+build.log
+.DS_Store
