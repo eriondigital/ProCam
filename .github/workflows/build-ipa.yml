@@ -4,13 +4,13 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-15, macos-15-intel]
-    runs-on: ${{ matrix.runner }}
+    # Intel Mac runners have short queues; the app is still built for iPhone (arm64).
+    runs-on: macos-15-intel
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -46,15 +46,19 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/ProCam.app Payload/
           zip -qry ProCam.ipa Payload
 
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: ProCam-ipa-${{ matrix.runner }}
-          path: ProCam.ipa
+      - name: Publish to Releases (direct download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" ProCam.ipa \
+            --title "ProCam build ${{ github.run_number }}" \
+            --notes "Unsigned IPA from commit ${GITHUB_SHA::7}. Install with Sideloadly." \
+            --latest
 
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ matrix.runner }}
+          name: build-log
           path: build.log
