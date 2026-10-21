@@ -4,7 +4,9 @@ struct CameraScreen: View {
     @StateObject private var cam = CameraController()
     @StateObject private var level = LevelMeter()
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("procam.onboarded") private var onboarded = false
 
+    @State private var showTour = false
     @State private var selected: ManualControl?
     @State private var showLooks = false
     @State private var showGrid = true
@@ -22,8 +24,8 @@ struct CameraScreen: View {
                 VStack(spacing: 0) {
                     topBar
                     viewfinder
-                    controlStrip.padding(.top, 8)
-                    modeRow.padding(.top, 4)
+                    controlStrip.padding(.top, 10)
+                    modeRow.padding(.top, 8)
                     Spacer(minLength: 4)
                     bottomBar.padding(.bottom, 8)
                 }
@@ -33,16 +35,28 @@ struct CameraScreen: View {
                 Text(toast)
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(Capsule().fill(Color.black.opacity(0.8)))
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .glass(Capsule())
                     .frame(maxHeight: .infinity, alignment: .top)
                     .padding(.top, 56)
-                    .transition(.opacity)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+        .animation(.snappy, value: cam.toast)
         .onAppear {
-            cam.start()
+            if onboarded {
+                cam.start()
+            } else {
+                showTour = true
+            }
             level.start()
+        }
+        .fullScreenCover(isPresented: $showTour) {
+            OnboardingView {
+                onboarded = true
+                showTour = false
+                cam.start()
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -62,38 +76,55 @@ struct CameraScreen: View {
     // MARK: Top bar
 
     private var topBar: some View {
-        HStack(spacing: 6) {
-            ForEach(CaptureFormat.allCases) { f in
-                let supported = f == .heif
-                    || (f == .proRAW && cam.supportsProRAW)
-                    || (f == .raw && cam.supportsBayerRAW)
-                let enabled = supported && (cam.mode == .photo || f == .heif)
-                Button {
-                    Haptics.tap()
-                    cam.setFormat(f)
-                } label: {
-                    Text(f.rawValue)
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .padding(.horizontal, 9).padding(.vertical, 5)
-                        .background(Capsule().fill(cam.format == f ? Color.accentCam : Color.white.opacity(0.1)))
-                        .foregroundStyle(cam.format == f ? Color.black : Color.white.opacity(enabled ? 0.9 : 0.3))
+        HStack(spacing: 8) {
+            GlassGroup(spacing: 6) {
+                HStack(spacing: 4) {
+                    ForEach(CaptureFormat.allCases) { f in
+                        let supported = f == .heif
+                            || (f == .proRAW && cam.supportsProRAW)
+                            || (f == .raw && cam.supportsBayerRAW)
+                        let enabled = supported && (cam.mode == .photo || f == .heif)
+                        let active = cam.format == f
+                        Button {
+                            Haptics.tap()
+                            cam.setFormat(f)
+                        } label: {
+                            Text(f.rawValue)
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .foregroundStyle(active ? Color.black : Color.white.opacity(enabled ? 0.9 : 0.3))
+                                .background(Capsule().fill(active ? Color.accentCam : Color.clear))
+                        }
+                        .disabled(!enabled)
+                    }
                 }
-                .disabled(!enabled)
+                .padding(3)
+                .glassCapsule()
             }
             Spacer()
             if cam.timerSeconds > 0 {
                 Label("\(cam.timerSeconds)s", systemImage: "timer")
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .foregroundStyle(Color.accentCam)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .glassCapsule()
             }
             settingsMenu
         }
         .padding(.horizontal, 14)
-        .frame(height: 44)
+        .frame(height: 48)
     }
 
     private var settingsMenu: some View {
         Menu {
+            Section("Processing") {
+                Picker(selection: $cam.processing) {
+                    ForEach(ProcessingStyle.allCases) { Text($0.rawValue).tag($0) }
+                } label: {
+                    Label("Processing", systemImage: "wand.and.stars")
+                }
+                .pickerStyle(.menu)
+            }
             Section("Overlays") {
                 Toggle(isOn: $cam.showHistogram) { Label("Histogram", systemImage: "chart.bar.xaxis") }
                 Toggle(isOn: $cam.showPeaking) { Label("Focus peaking", systemImage: "scope") }
@@ -112,16 +143,24 @@ struct CameraScreen: View {
                 }
                 .pickerStyle(.menu)
             }
-            Button {
-                cam.resetAll()
-            } label: {
-                Label("Reset manual controls", systemImage: "arrow.counterclockwise")
+            Section {
+                Button {
+                    cam.resetAll()
+                } label: {
+                    Label("Reset manual controls", systemImage: "arrow.counterclockwise")
+                }
+                Button {
+                    showTour = true
+                } label: {
+                    Label("Feature tour", systemImage: "sparkles")
+                }
             }
         } label: {
             Image(systemName: "slider.horizontal.3")
                 .font(.system(size: 16, weight: .semibold))
-                .frame(width: 36, height: 32)
-                .foregroundStyle(.white.opacity(0.85))
+                .foregroundStyle(.white)
+                .frame(width: 40, height: 36)
+                .glassCircle()
         }
     }
 
@@ -188,7 +227,7 @@ struct CameraScreen: View {
             .clipped()
         }
         .aspectRatio(3.0 / 4.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
     private func showReticle(at point: CGPoint) {
@@ -204,15 +243,16 @@ struct CameraScreen: View {
     private var statusOverlay: some View {
         if let n = cam.countdown {
             Text("\(n)")
-                .font(.system(size: 96, weight: .heavy, design: .rounded))
+                .font(.system(size: 88, weight: .heavy, design: .rounded))
                 .foregroundStyle(.white)
-                .shadow(radius: 8)
+                .frame(width: 150, height: 150)
+                .glass(Circle())
         } else if let done = cam.nightProgress {
-            StatusCard(title: "NIGHT \(done)/\(CameraController.nightFrameCount)",
-                       subtitle: "Hold still",
-                       progress: Double(done) / Double(CameraController.nightFrameCount))
+            StatusCard(title: "NIGHT \(done)/\(cam.nightTotal)",
+                       subtitle: cam.nightPlan.map { "Hold still · \($0)" } ?? "Hold still",
+                       progress: Double(done) / Double(max(cam.nightTotal, 1)))
         } else if cam.isMerging {
-            StatusCard(title: "MERGING", subtitle: "Aligning frames", progress: nil)
+            StatusCard(title: "DEVELOPING", subtitle: "Aligning and merging frames", progress: nil)
         } else if cam.holdingSteady {
             StatusCard(title: "HOLD STEADY", subtitle: "Waiting for a still moment", progress: nil)
         }
@@ -222,24 +262,29 @@ struct CameraScreen: View {
         VStack(spacing: 8) {
             HStack(alignment: .top) {
                 if cam.showHistogram {
-                    HistogramView(channels: cam.histogram).frame(width: 112, height: 52)
+                    HistogramView(channels: cam.histogram).frame(width: 118, height: 58)
                 }
                 Spacer()
-                VStack(alignment: .trailing, spacing: 6) {
-                    if cam.zoom > 1.01 {
-                        Badge(text: String(format: "%.1f×", cam.effectiveZoom))
-                    }
-                    if cam.steadyActive {
-                        Badge(text: "STEADY", icon: "gyroscope")
-                    }
-                    if cam.lockBox != nil {
-                        Badge(text: "LOCKED", icon: "scope")
-                    }
-                    if cam.aeafLocked {
-                        Badge(text: "AE/AF LOCK", icon: "lock.fill")
-                    }
-                    if cam.look != .natural {
-                        Badge(text: cam.look.rawValue.uppercased())
+                GlassGroup(spacing: 6) {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if cam.zoom > 1.01 {
+                            Badge(text: String(format: "%.1f×", cam.effectiveZoom))
+                        }
+                        if cam.steadyActive {
+                            Badge(text: "STEADY", icon: "gyroscope")
+                        }
+                        if cam.lockBox != nil {
+                            Badge(text: "LOCKED", icon: "scope")
+                        }
+                        if cam.aeafLocked {
+                            Badge(text: "AE/AF LOCK", icon: "lock.fill")
+                        }
+                        if cam.processing != .apple {
+                            Badge(text: cam.processing == .strong ? "DETAIL+" : "DETAIL", icon: "wand.and.stars")
+                        }
+                        if cam.look != .natural {
+                            Badge(text: cam.look.rawValue.uppercased())
+                        }
                     }
                 }
             }
@@ -258,21 +303,24 @@ struct CameraScreen: View {
 
     private var looksStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(Look.allCases) { l in
-                    Button {
-                        Haptics.tap()
-                        cam.look = l
-                    } label: {
-                        Text(l.rawValue)
-                            .font(.system(size: 12, weight: .semibold))
-                            .padding(.horizontal, 11).padding(.vertical, 7)
-                            .background(Capsule().fill(cam.look == l ? Color.accentCam : Color.black.opacity(0.55)))
-                            .foregroundStyle(cam.look == l ? Color.black : Color.white)
+            GlassGroup(spacing: 6) {
+                HStack(spacing: 6) {
+                    ForEach(Look.allCases) { l in
+                        let active = cam.look == l
+                        Button {
+                            Haptics.tap()
+                            cam.look = l
+                        } label: {
+                            Text(l.rawValue)
+                                .font(.system(size: 12, weight: .semibold))
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .foregroundStyle(active ? Color.black : Color.white)
+                                .glassCapsule(tint: active ? .accentCam : nil)
+                        }
                     }
                 }
+                .padding(.horizontal, 4)
             }
-            .padding(.horizontal, 4)
         }
     }
 
@@ -284,20 +332,20 @@ struct CameraScreen: View {
             } label: {
                 Text("AUTO")
                     .font(.system(size: 11, weight: .heavy, design: .monospaced))
-                    .padding(.horizontal, 8).padding(.vertical, 6)
-                    .background(Capsule().strokeBorder(cam.isManual(c) ? Color.white.opacity(0.5) : Color.accentCam, lineWidth: 1))
-                    .foregroundStyle(cam.isManual(c) ? Color.white : Color.accentCam)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .foregroundStyle(cam.isManual(c) ? Color.white : Color.black)
+                    .glassCapsule(tint: cam.isManual(c) ? nil : .accentCam)
             }
 
             if c == .ev && cam.exposureIsManual {
                 Text("Manual exposure: EV shows the meter")
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(.white.opacity(0.75))
                     .frame(maxWidth: .infinity, minHeight: 40)
             } else if c == .focus && !cam.manualFocusSupported {
                 Text("Manual focus isn't supported on this lens")
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(.white.opacity(0.75))
                     .frame(maxWidth: .infinity, minHeight: 40)
             } else {
                 RulerDial(progress: Binding(
@@ -307,28 +355,30 @@ struct CameraScreen: View {
                 .frame(height: 40)
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.55)))
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .glass(RoundedRectangle(cornerRadius: 20))
     }
 
     private var lensPicker: some View {
-        HStack(spacing: 6) {
-            ForEach(cam.lenses) { lens in
-                let active = lens.id == cam.currentDeviceID
-                Button {
-                    Haptics.tap()
-                    cam.select(lens)
-                } label: {
-                    Text(lens.label)
-                        .font(.system(size: active ? 13 : 11, weight: .bold, design: .rounded))
-                        .frame(width: 38, height: 38)
-                        .background(Circle().fill(Color.black.opacity(0.55)))
-                        .foregroundStyle(active ? Color.accentCam : Color.white)
+        GlassGroup(spacing: 4) {
+            HStack(spacing: 4) {
+                ForEach(cam.lenses) { lens in
+                    let active = lens.id == cam.currentDeviceID
+                    Button {
+                        Haptics.tap()
+                        cam.select(lens)
+                    } label: {
+                        Text(lens.label)
+                            .font(.system(size: active ? 13 : 11, weight: .bold, design: .rounded))
+                            .foregroundStyle(active ? Color.accentCam : Color.white)
+                            .frame(width: active ? 42 : 36, height: active ? 42 : 36)
+                            .glassCircle()
+                    }
                 }
             }
+            .padding(4)
         }
-        .padding(4)
-        .background(Capsule().fill(Color.black.opacity(0.25)))
+        .animation(.snappy, value: cam.currentDeviceID)
     }
 
     // MARK: Manual control strip
@@ -353,15 +403,18 @@ struct CameraScreen: View {
                             .lineLimit(1)
                             .minimumScaleFactor(0.7)
                             .foregroundStyle(cam.isManual(c) ? Color.accentCam : Color.white)
-                        Capsule()
-                            .fill(selected == c ? Color.accentCam : Color.clear)
-                            .frame(width: 16, height: 2)
                     }
                     .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule().fill(selected == c ? Color.white.opacity(0.14) : Color.clear)
+                    )
                 }
             }
         }
-        .padding(.horizontal, 8)
+        .padding(4)
+        .glass(Capsule())
+        .padding(.horizontal, 12)
     }
 
     // MARK: Mode row
@@ -376,31 +429,39 @@ struct CameraScreen: View {
                 }
             } label: {
                 Image(systemName: "camera.filters")
-                    .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 44, height: 30)
-                    .foregroundStyle(showLooks || cam.look != .natural ? Color.accentCam : Color.white.opacity(0.75))
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(showLooks || cam.look != .natural ? Color.accentCam : Color.white)
+                    .frame(width: 40, height: 36)
+                    .glassCircle()
             }
 
             Spacer()
 
-            HStack(spacing: 22) {
+            HStack(spacing: 4) {
                 ForEach(ShootMode.allCases) { m in
+                    let active = cam.mode == m
                     Button {
                         Haptics.tap()
                         cam.setMode(m)
                     } label: {
-                        Text(m.rawValue)
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundStyle(cam.mode == m ? Color.accentCam : Color.white.opacity(0.55))
+                        Label(m.rawValue, systemImage: m == .night ? "moon.fill" : "camera.fill")
+                            .labelStyle(.titleAndIcon)
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .foregroundStyle(active ? Color.black : Color.white.opacity(0.75))
+                            .background(Capsule().fill(active ? Color.accentCam : Color.clear))
                     }
                 }
             }
+            .padding(3)
+            .glassCapsule()
 
             Spacer()
 
-            Color.clear.frame(width: 44, height: 30)
+            Color.clear.frame(width: 40, height: 36)
         }
         .padding(.horizontal, 14)
+        .animation(.snappy, value: cam.mode)
     }
 
     // MARK: Bottom bar
@@ -414,12 +475,15 @@ struct CameraScreen: View {
                     if let t = cam.lastThumbnail {
                         Image(uiImage: t).resizable().scaledToFill()
                     } else {
-                        Color.white.opacity(0.08)
+                        Image(systemName: "photo.on.rectangle")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.white.opacity(0.6))
                     }
                 }
-                .frame(width: 52, height: 52)
+                .frame(width: 46, height: 46)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.2)))
+                .padding(4)
+                .glass(RoundedRectangle(cornerRadius: 14), interactive: true)
             }
 
             Spacer()
@@ -428,6 +492,8 @@ struct CameraScreen: View {
                 Haptics.shutter()
                 cam.shutterPressed()
             }
+            .padding(5)
+            .glassCircle()
             .opacity(cam.isBusy ? 0.5 : 1)
 
             Spacer()
@@ -438,11 +504,11 @@ struct CameraScreen: View {
             } label: {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 20, weight: .semibold))
-                    .frame(width: 52, height: 52)
-                    .background(Circle().fill(Color.white.opacity(0.1)))
                     .foregroundStyle(.white)
+                    .frame(width: 54, height: 54)
+                    .glassCircle()
             }
         }
-        .padding(.horizontal, 28)
+        .padding(.horizontal, 26)
     }
 }

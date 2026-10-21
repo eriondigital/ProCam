@@ -15,6 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select newest Xcode (26+ enables Liquid Glass)
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$X" ]; then sudo xcode-select -s "$X"; fi
+          xcodebuild -version | tee xcode-version.txt
+          echo "XCODE_VERSION=$(head -1 xcode-version.txt)" >> "$GITHUB_ENV"
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -36,9 +44,12 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee build.log
 
-      - name: Show compile errors
+      - name: Report compile errors as annotations
         if: failure()
-        run: grep -E "error:" build.log | sort -u || true
+        run: |
+          grep -E ": error: " build.log | sed -E 's#^.*/ProCam/##' | sort -u | head -40 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
 
       - name: Package IPA
         run: |
@@ -53,7 +64,7 @@ jobs:
           TAG="build-${{ github.run_number }}"
           gh release create "$TAG" ProCam.ipa \
             --title "ProCam build ${{ github.run_number }}" \
-            --notes "Unsigned IPA from commit ${GITHUB_SHA::7}. Install with Sideloadly." \
+            --notes "Unsigned IPA from commit ${GITHUB_SHA::7}, built with ${XCODE_VERSION}. Install with Sideloadly." \
             --latest
 
       - name: Upload build log

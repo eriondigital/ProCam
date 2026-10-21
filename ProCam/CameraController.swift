@@ -45,7 +45,6 @@ final class CameraController: NSObject, ObservableObject {
     let renderer = ViewfinderRenderer()
 
     static let steadyMargin: CGFloat = 1.35
-    static let nightFrameCount = 8
     static let wbRange: ClosedRange<Float> = 2500...10000
 
     // Permission / devices
@@ -103,7 +102,15 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var countdown: Int?
     @Published private(set) var holdingSteady = false
     @Published private(set) var nightProgress: Int?
+    @Published private(set) var nightTotal = 8
+    @Published private(set) var nightPlan: String?
     @Published private(set) var isMerging = false
+
+    // Processing
+    @Published var processing: ProcessingStyle = ProcessingStyle(
+        rawValue: UserDefaults.standard.string(forKey: "procam.processing") ?? "") ?? .natural {
+        didSet { UserDefaults.standard.set(processing.rawValue, forKey: "procam.processing") }
+    }
 
     // Feedback
     @Published private(set) var lastThumbnail: UIImage?
@@ -149,14 +156,19 @@ final class CameraController: NSObject, ObservableObject {
 
     // Capture bookkeeping (kindsLock)
     private enum CaptureKind {
-        case single(crop: CGFloat, look: Look)
+        case single(crop: CGFloat, look: Look, style: ProcessingStyle)
         case night
     }
     private let kindsLock = NSLock()
     private var captureKinds: [Int64: CaptureKind] = [:]
-    private var nightFrames: [Data] = []
+    private var nightReceived = 0
+    private var nightTarget = 0
     private var nightCrop: CGFloat = 1
     private var nightLook: Look = .natural
+    private var nightStyle: ProcessingStyle = .natural
+
+    // Night merge state (processingQueue)
+    private var nightAccumulator: NightAccumulator?
 
     // Main-thread helpers
     private var pinchBase: CGFloat = 1
@@ -763,21 +775,38 @@ final class CameraController: NSObject, ObservableObject {
 
     private func captureSingle() {
         let crop: CGFloat = (steadyActive && format == .heif) ? softCrop : 1
-        let look: Look = format == .heif ? self.look : .natural
+        let look = self.look
+        let style = processing
         sessionQueue.async {
             guard self.isConfigured else { return }
             let settings = self.makeSettings()
-            self.register(settings.uniqueID, .single(crop: crop, look: look))
+            self.register(settings.uniqueID, .single(crop: crop, look: look, style: style))
             self.applyCaptureRotation()
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
 
+    // MARK: Night mode
+    //
+    // 1. Plan: take the auto-exposure the camera picked and push it +1.3 EV, putting as much of it
+    //    as possible into exposure *time* (cleaner than ISO). Handheld frames are capped at 1/8 s to
+    //    avoid blur; on a tripod (gyro says still) up to 1/2 s.
+    // 2. Lock exposure, focus and white balance so every frame matches.
+    // 3. Shoot the burst one frame after another; each frame is aligned and folded into a running
+    //    average immediately (NightAccumulator), so memory stays low.
+    // 4. Denoise, auto-brighten, lift shadows, ProCam Detail, Look → HEIF.
+
     private func startNightStack() {
         let crop: CGFloat = steadyActive ? softCrop : 1
         let look = self.look
+        let style = processing
         let manualExposure = exposureIsManual, manualFocus = focusManual, manualWB = wbManual
+        let still = MotionHub.shared.shakeLevel < 0.02
+        let frames = still ? 6 : 10
+        nightTotal = frames
         nightProgress = 0
+
+        processingQueue.async { self.nightAccumulator = NightAccumulator() }
 
         sessionQueue.async {
             guard self.isConfigured, let d = self.deviceInput?.device else {
@@ -785,25 +814,45 @@ final class CameraController: NSObject, ObservableObject {
                 return
             }
             self.kindsLock.lock()
-            self.nightFrames = []
+            self.nightReceived = 0
+            self.nightTarget = frames
             self.nightCrop = crop
             self.nightLook = look
+            self.nightStyle = style
             self.kindsLock.unlock()
 
-            // Brighten a bit (the stack removes the extra noise), let AE settle, then freeze everything
-            // so all frames match.
-            if !manualExposure, (try? d.lockForConfiguration()) != nil {
-                d.setExposureTargetBias(min(0.7, d.maxExposureTargetBias), completionHandler: nil)
-                d.unlockForConfiguration()
-            }
-            self.sessionQueue.asyncAfter(deadline: .now() + 0.35) {
-                if (try? d.lockForConfiguration()) != nil {
-                    if !manualExposure, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
-                    if !manualFocus, d.isFocusModeSupported(.locked) { d.focusMode = .locked }
-                    if !manualWB, d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-                    d.unlockForConfiguration()
-                }
+            guard (try? d.lockForConfiguration()) != nil else {
                 self.captureNightFrame()
+                return
+            }
+            if !manualFocus, d.isFocusModeSupported(.locked) { d.focusMode = .locked }
+            if !manualWB, d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
+
+            if !manualExposure, d.isExposureModeSupported(.custom) {
+                let f = d.activeFormat
+                let minDur = f.minExposureDuration.seconds
+                let maxDur = max(minDur, min(f.maxExposureDuration.seconds, still ? 0.5 : 0.125))
+                let minISO = Double(f.minISO), maxISO = Double(f.maxISO)
+                // Exposure "amount" = ISO × seconds. Target: what AE chose, +1.3 EV.
+                let target = Double(d.iso) * d.exposureDuration.seconds * pow(2, 1.3)
+                let duration = min(max(target / minISO, minDur), maxDur)
+                let iso = min(max(target / duration, minISO), maxISO)
+                let plan = "\(CameraController.shutterString(duration)) · ISO \(Int(iso)) · \(frames) frames"
+                DispatchQueue.main.async { self.nightPlan = plan }
+
+                d.setExposureModeCustom(duration: CMTime(seconds: duration, preferredTimescale: 1_000_000_000),
+                                        iso: Float(iso)) { _ in
+                    // Wait one more frame so the new exposure is in effect.
+                    self.sessionQueue.asyncAfter(deadline: .now() + duration + 0.05) {
+                        self.captureNightFrame()
+                    }
+                }
+                d.unlockForConfiguration()
+            } else {
+                if d.isExposureModeSupported(.locked) && !manualExposure { d.exposureMode = .locked }
+                d.unlockForConfiguration()
+                DispatchQueue.main.async { self.nightPlan = "\(frames) frames" }
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.1) { self.captureNightFrame() }
             }
         }
     }
@@ -821,33 +870,37 @@ final class CameraController: NSObject, ObservableObject {
 
     private func finishNight() {
         kindsLock.lock()
-        let frames = nightFrames
-        let crop = nightCrop
-        let look = nightLook
-        nightFrames = []
+        let crop = nightCrop, look = nightLook, style = nightStyle, total = nightTarget
         kindsLock.unlock()
 
         DispatchQueue.main.async {
             self.nightProgress = nil
+            self.nightPlan = nil
             self.isMerging = true
-            // restore normal exposure / focus / WB
             self.applyExposure()
             self.applyFocus()
             self.applyWhiteBalance()
         }
 
+        // Queued after every frame's add(), so all frames are merged by the time this runs.
         processingQueue.async {
             defer { DispatchQueue.main.async { self.isMerging = false } }
-            guard !frames.isEmpty,
-                  let merged = NightStacker.merge(frames),
-                  let data = PhotoProcessor.render(merged.image, properties: merged.properties, crop: crop, look: look) else {
-                self.showToast("Night Stack failed")
+            let acc = self.nightAccumulator
+            self.nightAccumulator = nil
+            guard let acc, acc.count > 0 else {
+                self.showToast("Night mode failed: no usable frames")
                 return
             }
+            guard let data = acc.finish(crop: crop, look: look, style: style) else {
+                self.showToast("Night mode failed while saving")
+                return
+            }
+            let used = acc.count
             let thumb = Self.makeThumbnail(data)
             DispatchQueue.main.async { self.lastThumbnail = thumb }
-            PhotoLibrary.save(data, isRaw: false) { [weak self] ok in
-                self?.showToast(ok ? "Night Stack saved (\(frames.count) frames)" : "Couldn't save. Allow Photos access in Settings.")
+            PhotoLibrary.save(photo: data, raw: nil) { [weak self] ok in
+                self?.showToast(ok ? "Night photo saved · \(used)/\(total) frames merged"
+                                   : "Couldn't save. Allow Photos access in Settings.")
             }
         }
     }
@@ -935,17 +988,18 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
 
         if case .night? = kind {
             if let data {
-                kindsLock.lock()
-                nightFrames.append(data)
-                let count = nightFrames.count
-                kindsLock.unlock()
-                DispatchQueue.main.async { self.nightProgress = count }
-                if count < Self.nightFrameCount {
-                    sessionQueue.async { self.captureNightFrame() }
-                    return
-                }
+                processingQueue.async { self.nightAccumulator?.add(data) }
             }
-            finishNight()  // done, or a frame failed: merge what we have
+            kindsLock.lock()
+            nightReceived += 1
+            let received = nightReceived, target = nightTarget
+            kindsLock.unlock()
+            DispatchQueue.main.async { self.nightProgress = received }
+            if received < target {
+                sessionQueue.async { self.captureNightFrame() }
+            } else {
+                finishNight()
+            }
             return
         }
 
@@ -957,16 +1011,29 @@ extension CameraController: AVCapturePhotoCaptureDelegate {
         let isRaw = photo.isRawPhoto
         var crop: CGFloat = 1
         var look: Look = .natural
-        if case .single(let c, let l)? = kind {
+        var style: ProcessingStyle = .apple
+        if case .single(let c, let l, let st)? = kind {
             crop = c
             look = l
+            style = st
         }
 
         processingQueue.async {
-            let final = isRaw ? data : PhotoProcessor.process(data, crop: crop, look: look)
-            let thumb = Self.makeThumbnail(final)
+            var heif: Data?
+            var raw: Data?
+            if isRaw {
+                raw = data
+                // ProCam develops its own HEIF from the RAW; the DNG is kept alongside it.
+                if style != .apple {
+                    heif = PhotoProcessor.develop(raw: data, look: look, style: style)
+                    if heif == nil { self.showToast("RAW develop failed. Saved the DNG only.") }
+                }
+            } else {
+                heif = PhotoProcessor.process(data, crop: crop, look: look, style: style)
+            }
+            let thumb = Self.makeThumbnail(heif ?? data)
             DispatchQueue.main.async { self.lastThumbnail = thumb }
-            PhotoLibrary.save(final, isRaw: isRaw) { [weak self] ok in
+            PhotoLibrary.save(photo: heif, raw: raw) { [weak self] ok in
                 if !ok { self?.showToast("Couldn't save. Allow Photos access in Settings.") }
             }
         }

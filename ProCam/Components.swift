@@ -122,8 +122,8 @@ struct HistogramView: View {
                 ctx.fill(path, with: .color(colors[i].opacity(0.75)))
             }
         }
-        .padding(4)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.45)))
+        .padding(6)
+        .glass(RoundedRectangle(cornerRadius: 12))
         .allowsHitTesting(false)
     }
 }
@@ -191,8 +191,8 @@ struct Badge: View {
         }
         .font(.system(size: 11, weight: .bold, design: .monospaced))
         .foregroundStyle(Color.accentCam)
-        .padding(.horizontal, 8).padding(.vertical, 4)
-        .background(Capsule().fill(Color.black.opacity(0.55)))
+        .padding(.horizontal, 9).padding(.vertical, 5)
+        .glass(Capsule())
     }
 }
 
@@ -234,8 +234,8 @@ struct StatusCard: View {
                 Text(subtitle).font(.caption).foregroundStyle(.white.opacity(0.8))
             }
         }
-        .padding(16)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color.black.opacity(0.6)))
+        .padding(18)
+        .glass(RoundedRectangle(cornerRadius: 22))
     }
 }
 
@@ -252,7 +252,7 @@ struct PermissionView: View {
                     UIApplication.shared.open(url)
                 }
             }
-            .buttonStyle(.borderedProminent)
+            .prominentGlassButton()
             .tint(.accentCam)
         }
         .foregroundStyle(.white)
